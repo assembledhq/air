@@ -3,8 +3,10 @@ package runner
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -708,6 +710,93 @@ go 1.17
 	return nil
 }
 
+// generateVersionedGoCode generates golang code with a simple versioned HTTP handler
+func generateVersionedGoCode(dir string, port int, version string) error {
+	code := fmt.Sprintf(`package main
+
+import (
+	"fmt"
+	"log"
+	"net/http"
+)
+
+func main() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "%s")
+	})
+	log.Fatal(http.ListenAndServe(":%v", nil))
+}
+`, version, port)
+	file, err := os.Create(dir + "/main.go")
+	if err != nil {
+		return err
+	}
+	_, err = file.WriteString(code)
+	if err != nil {
+		return err
+	}
+
+	// generate go mod file
+	mod := `module air.sample.com
+
+go 1.17
+`
+	file, err = os.Create(dir + "/go.mod")
+	if err != nil {
+		return err
+	}
+	_, err = file.WriteString(mod)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func initTestEnvWithVersionedCode(t *testing.T, port int, version string) string {
+	tempDir := t.TempDir()
+	t.Logf("tempDir: %s", tempDir)
+	err := generateVersionedGoCode(tempDir, port, version)
+	if err != nil {
+		t.Fatalf("Should not be fail: %s.", err)
+	}
+	return tempDir
+}
+
+func makeHTTPRequest(port int) (string, error) {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/", port))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(body), nil
+}
+
+func updateVersionInCode(dir string, newVersion string) error {
+	content, err := os.ReadFile(dir + "/main.go")
+	if err != nil {
+		return err
+	}
+
+	contentStr := string(content)
+	lines := strings.Split(contentStr, "\n")
+
+	for i, line := range lines {
+		if strings.Contains(line, "fmt.Fprint(w,") {
+			lines[i] = fmt.Sprintf(`		fmt.Fprint(w, "%s")`, newVersion)
+			break
+		}
+	}
+
+	newContent := strings.Join(lines, "\n")
+	return os.WriteFile(dir+"/main.go", []byte(newContent), 0o644)
+}
+
 func TestRebuildWhenRunCmdUsingDLV(t *testing.T) {
 	// generate a random port
 	port, f := GetPort()
@@ -1140,4 +1229,89 @@ func TestEngineExit(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConcurrentBuilds(t *testing.T) {
+	// generate a random port
+	port, f := GetPort()
+	f()
+	t.Logf("port: %d", port)
+
+	tmpDir := initTestEnvWithVersionedCode(t, port, "version1")
+	// change dir to tmpDir
+	chdir(t, tmpDir)
+	engine, err := NewEngine("", nil, true)
+	if err != nil {
+		t.Fatalf("Should not be fail: %s.", err)
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		engine.Run()
+		t.Logf("engine stopped")
+		wg.Done()
+	}()
+
+	// wait for initial build to complete
+	err = waitingPortReady(t, port, time.Second*10)
+	if err != nil {
+		t.Fatalf("Should not be fail: %s.", err)
+	}
+	t.Logf("initial port is ready")
+
+	// verify initial version
+	response, err := makeHTTPRequest(port)
+	if err != nil {
+		t.Fatalf("Failed to make initial request: %s", err)
+	}
+	if response != "version1" {
+		t.Fatalf("Expected 'version1', got '%s'", response)
+	}
+
+	// trigger first rebuild
+	t.Logf("triggering first rebuild to version2")
+	err = updateVersionInCode(tmpDir, "version2")
+	if err != nil {
+		t.Fatalf("Failed to update code: %s", err)
+	}
+
+	// immediately trigger second rebuild while first may still be building
+	time.Sleep(time.Millisecond * 50)
+	t.Logf("triggering second rebuild to version3")
+	err = updateVersionInCode(tmpDir, "version3")
+	if err != nil {
+		t.Fatalf("Failed to update code: %s", err)
+	}
+
+	// wait for connection to be refused (rebuild in progress)
+	err = waitingPortConnectionRefused(t, port, time.Second*10)
+	if err != nil {
+		t.Fatalf("timeout waiting for rebuild: %s.", err)
+	}
+	t.Logf("connection refused - rebuild in progress")
+
+	// wait for port to be ready again (both rebuilds complete)
+	err = waitingPortReady(t, port, time.Second*15)
+	if err != nil {
+		t.Fatalf("timeout waiting for rebuild to complete: %s.", err)
+	}
+	t.Logf("port is ready after rebuilds")
+
+	// verify that the final running binary reflects the second build (version3)
+	response, err = makeHTTPRequest(port)
+	if err != nil {
+		t.Fatalf("Failed to make final request: %s", err)
+	}
+	if response != "version3" {
+		t.Fatalf("Expected 'version3' (second build), got '%s'", response)
+	}
+	t.Logf("verified final version is version3 - second build was reflected")
+
+	// stop engine
+	engine.Stop()
+	t.Logf("engine stopped")
+	wg.Wait()
+	time.Sleep(time.Second * 1)
+	assert.True(t, checkPortConnectionRefused(port))
 }
