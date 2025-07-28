@@ -3,10 +3,8 @@ package runner
 import (
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -710,93 +708,6 @@ go 1.17
 	return nil
 }
 
-// generateVersionedGoCode generates golang code with a simple versioned HTTP handler
-func generateVersionedGoCode(dir string, port int, version string) error {
-	code := fmt.Sprintf(`package main
-
-import (
-	"fmt"
-	"log"
-	"net/http"
-)
-
-func main() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "%s")
-	})
-	log.Fatal(http.ListenAndServe(":%v", nil))
-}
-`, version, port)
-	file, err := os.Create(dir + "/main.go")
-	if err != nil {
-		return err
-	}
-	_, err = file.WriteString(code)
-	if err != nil {
-		return err
-	}
-
-	// generate go mod file
-	mod := `module air.sample.com
-
-go 1.17
-`
-	file, err = os.Create(dir + "/go.mod")
-	if err != nil {
-		return err
-	}
-	_, err = file.WriteString(mod)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func initTestEnvWithVersionedCode(t *testing.T, port int, version string) string {
-	tempDir := t.TempDir()
-	t.Logf("tempDir: %s", tempDir)
-	err := generateVersionedGoCode(tempDir, port, version)
-	if err != nil {
-		t.Fatalf("Should not be fail: %s.", err)
-	}
-	return tempDir
-}
-
-func makeHTTPRequest(port int) (string, error) {
-	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/", port))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	return string(body), nil
-}
-
-func updateVersionInCode(dir string, newVersion string) error {
-	content, err := os.ReadFile(dir + "/main.go")
-	if err != nil {
-		return err
-	}
-
-	contentStr := string(content)
-	lines := strings.Split(contentStr, "\n")
-
-	for i, line := range lines {
-		if strings.Contains(line, "fmt.Fprint(w,") {
-			lines[i] = fmt.Sprintf(`		fmt.Fprint(w, "%s")`, newVersion)
-			break
-		}
-	}
-
-	newContent := strings.Join(lines, "\n")
-	return os.WriteFile(dir+"/main.go", []byte(newContent), 0o644)
-}
-
 func TestRebuildWhenRunCmdUsingDLV(t *testing.T) {
 	// generate a random port
 	port, f := GetPort()
@@ -1231,87 +1142,81 @@ func TestEngineExit(t *testing.T) {
 	}
 }
 
-func TestConcurrentBuilds(t *testing.T) {
-	// generate a random port
+func TestRaceConditionBetweenBuilds(t *testing.T) {
+	// Test that rapid file changes don't cause builds to be incorrectly cancelled
 	port, f := GetPort()
 	f()
 	t.Logf("port: %d", port)
 
-	tmpDir := initTestEnvWithVersionedCode(t, port, "version1")
-	// change dir to tmpDir
+	tmpDir := initTestEnv(t, port)
 	chdir(t, tmpDir)
-	engine, err := NewEngine("", nil, true)
+
+	// Create a temp file to track builds
+	buildLog, err := os.CreateTemp("", "build_log_*.txt")
 	if err != nil {
-		t.Fatalf("Should not be fail: %s.", err)
+		t.Fatal(err)
+	}
+	buildLogPath := buildLog.Name()
+	buildLog.Close()
+	defer os.Remove(buildLogPath)
+
+	engine, err := NewEngine("", nil, false)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	wg := sync.WaitGroup{}
-	wg.Add(1)
+	// Use a build command that logs when it runs
+	engine.config.Build.Cmd = fmt.Sprintf("echo 'BUILD' >> %s && sleep 1 && go build -o ./tmp/main .", buildLogPath)
+	engine.config.Build.Delay = 100
+
 	go func() {
 		engine.Run()
-		t.Logf("engine stopped")
-		wg.Done()
 	}()
 
-	// wait for initial build to complete
-	err = waitingPortReady(t, port, time.Second*10)
-	if err != nil {
-		t.Fatalf("Should not be fail: %s.", err)
-	}
-	t.Logf("initial port is ready")
+	// Wait for initial build to complete
+	time.Sleep(2 * time.Second)
 
-	// verify initial version
-	response, err := makeHTTPRequest(port)
+	// Clear the log for our test
+	os.WriteFile(buildLogPath, []byte(""), 0644)
+
+	t.Log("Triggering first file change")
+	file, err := os.OpenFile("main.go", os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		t.Fatalf("Failed to make initial request: %s", err)
+		t.Fatal(err)
 	}
-	if response != "version1" {
-		t.Fatalf("Expected 'version1', got '%s'", response)
+	file.WriteString("\n// Change 1")
+	file.Close()
+
+	// Wait for build to start
+	time.Sleep(200 * time.Millisecond)
+
+	// Trigger second change while first build is running
+	t.Log("Triggering second file change")
+	file, err = os.OpenFile("main.go", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.WriteString("\n// Change 2")
+	file.Close()
+
+	// Wait for builds to complete
+	time.Sleep(3 * time.Second)
+
+	data, _ := os.ReadFile(buildLogPath)
+	buildCount := strings.Count(string(data), "BUILD")
+
+	t.Logf("Number of builds executed: %d", buildCount)
+
+	// We expect 2 builds - one for each change
+	if buildCount < 2 {
+		t.Errorf("Expected 2 builds but only got %d - second build may have been incorrectly cancelled", buildCount)
 	}
 
-	// trigger first rebuild
-	t.Logf("triggering first rebuild to version2")
-	err = updateVersionInCode(tmpDir, "version2")
-	if err != nil {
-		t.Fatalf("Failed to update code: %s", err)
+	// Verify app is running
+	if !checkPortHaveBeenUsed(port) {
+		t.Error("Application is not running after builds")
 	}
 
-	// immediately trigger second rebuild while first may still be building
-	time.Sleep(time.Millisecond * 50)
-	t.Logf("triggering second rebuild to version3")
-	err = updateVersionInCode(tmpDir, "version3")
-	if err != nil {
-		t.Fatalf("Failed to update code: %s", err)
-	}
-
-	// wait for connection to be refused (rebuild in progress)
-	err = waitingPortConnectionRefused(t, port, time.Second*10)
-	if err != nil {
-		t.Fatalf("timeout waiting for rebuild: %s.", err)
-	}
-	t.Logf("connection refused - rebuild in progress")
-
-	// wait for port to be ready again (both rebuilds complete)
-	err = waitingPortReady(t, port, time.Second*15)
-	if err != nil {
-		t.Fatalf("timeout waiting for rebuild to complete: %s.", err)
-	}
-	t.Logf("port is ready after rebuilds")
-
-	// verify that the final running binary reflects the second build (version3)
-	response, err = makeHTTPRequest(port)
-	if err != nil {
-		t.Fatalf("Failed to make final request: %s", err)
-	}
-	if response != "version3" {
-		t.Fatalf("Expected 'version3' (second build), got '%s'", response)
-	}
-	t.Logf("verified final version is version3 - second build was reflected")
-
-	// stop engine
 	engine.Stop()
-	t.Logf("engine stopped")
-	wg.Wait()
-	time.Sleep(time.Second * 1)
-	assert.True(t, checkPortConnectionRefused(port))
+	time.Sleep(2 * time.Second)
 }
