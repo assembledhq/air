@@ -48,8 +48,8 @@ release: check
 
 .PHONY: docker-image
 docker-image:
-	docker build -t cosmtrek/air:$(AIRVER) -f ./Dockerfile .
+	docker build -t assembledhq/air:$(AIRVER) -f ./Dockerfile .
 
 .PHONY: push-docker-image
 push-docker-image:
-	docker push cosmtrek/air:$(AIRVER)
+	docker push assembledhq/air:$(AIRVER)
