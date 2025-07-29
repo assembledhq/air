@@ -1141,3 +1141,82 @@ func TestEngineExit(t *testing.T) {
 		})
 	}
 }
+
+func TestRaceConditionBetweenBuilds(t *testing.T) {
+	// Test that rapid file changes don't cause builds to be incorrectly cancelled
+	port, f := GetPort()
+	f()
+	t.Logf("port: %d", port)
+
+	tmpDir := initTestEnv(t, port)
+	chdir(t, tmpDir)
+
+	// Create a temp file to track builds
+	buildLog, err := os.CreateTemp("", "build_log_*.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildLogPath := buildLog.Name()
+	buildLog.Close()
+	defer os.Remove(buildLogPath)
+
+	engine, err := NewEngine("", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a build command that logs when it runs
+	engine.config.Build.Cmd = fmt.Sprintf("echo 'BUILD' >> %s && sleep 1 && go build -o ./tmp/main .", buildLogPath)
+	engine.config.Build.Delay = 100
+
+	go func() {
+		engine.Run()
+	}()
+
+	// Wait for initial build to complete
+	time.Sleep(2 * time.Second)
+
+	// Clear the log for our test
+	os.WriteFile(buildLogPath, []byte(""), 0644)
+
+	t.Log("Triggering first file change")
+	file, err := os.OpenFile("main.go", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.WriteString("\n// Change 1")
+	file.Close()
+
+	// Wait for build to start
+	time.Sleep(200 * time.Millisecond)
+
+	// Trigger second change while first build is running
+	t.Log("Triggering second file change")
+	file, err = os.OpenFile("main.go", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.WriteString("\n// Change 2")
+	file.Close()
+
+	// Wait for builds to complete
+	time.Sleep(3 * time.Second)
+
+	data, _ := os.ReadFile(buildLogPath)
+	buildCount := strings.Count(string(data), "BUILD")
+
+	t.Logf("Number of builds executed: %d", buildCount)
+
+	// We expect 2 builds - one for each change
+	if buildCount < 2 {
+		t.Errorf("Expected 2 builds but only got %d - second build may have been incorrectly cancelled", buildCount)
+	}
+
+	// Verify app is running
+	if !checkPortHaveBeenUsed(port) {
+		t.Error("Application is not running after builds")
+	}
+
+	engine.Stop()
+	time.Sleep(2 * time.Second)
+}
